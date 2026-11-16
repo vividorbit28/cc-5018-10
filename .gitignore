@@ -21,5 +21,6 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 *.log
+data/
 .env
 .env.*

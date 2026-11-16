@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>演出总控 · Show Control</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark"></span>
+      <div>
+        <h1>演出总控</h1>
+        <p>Master control switcher · 帧同步 + 音频重采样</p>
+      </div>
+    </div>
+    <div class="clock-block">
+      <div class="clock-label">PROGRAM TIMECODE</div>
+      <div class="clock" id="program-tc">00:00:00:00</div>
+      <div class="clock-sub">
+        <span id="program-frame">FRAME 0000000</span>
+        <span id="program-pts">PTS 0.000s</span>
+      </div>
+    </div>
+    <div class="health">
+      <div class="pill" id="conn-pill" data-state="connecting">连接中</div>
+      <div class="outline">
+        <span id="out-format">1280x720@25 · 48 kHz</span>
+        <span id="out-lag" class="dim">编码延迟 --</span>
+      </div>
+      <div class="timeline">
+        <span class="dim">样本计数</span>
+        <strong id="program-sample">0</strong>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel sources-panel">
+      <div class="panel-head">
+        <h2>信号源</h2>
+        <span class="dim" id="source-summary">3 路输入 · 独立时钟</span>
+      </div>
+      <div class="source-list" id="source-list"></div>
+      <div class="hint">
+        点击信号源 → 进入预监（PVW）。按 TAKE 或再次点击已选源的 <b>TAKE</b> 键切到节目（PGM）。
+      </div>
+    </section>
+
+    <section class="panel monitor-panel">
+      <div class="monitor-head">
+        <div class="mon-head-block">
+          <span class="tally" data-role="pv">PVW</span>
+          <span id="preview-name">—</span>
+        </div>
+        <div class="monitor-actions">
+          <button id="sel-preview-source" class="btn small">选择预监源</button>
+        </div>
+      </div>
+      <div class="screens">
+        <figure class="screen preview-screen">
+          <img id="preview-img" alt="预监画面" />
+          <figcaption>
+            <span>总控预监 · PREVIEW</span>
+            <span class="dim" id="preview-meta">—</span>
+          </figcaption>
+        </figure>
+        <figure class="screen program-screen">
+          <img id="program-img" alt="节目画面" />
+          <figcaption>
+            <span class="onair"><i></i>节目输出 · ON AIR</span>
+            <span class="dim" id="program-meta">—</span>
+          </figcaption>
+        </figure>
+      </div>
+      <div class="take-bar">
+        <button id="take-btn" class="btn take" disabled>
+          TAKE <span id="take-target">—</span>
+        </button>
+        <div class="take-status" id="take-status">选择预监源后按 TAKE 切入节目</div>
+      </div>
+    </section>
+
+    <section class="panel output-panel">
+      <div class="panel-head">
+        <h2>节目输出</h2>
+        <span class="dim">真实编码流 · HLS</span>
+      </div>
+      <div class="program-player">
+        <video id="program-video" muted playsinline controls></video>
+        <div class="player-note" id="player-note">HLS 播放中…</div>
+      </div>
+      <div class="audio-block">
+        <div class="audio-head">
+          <span>输出声音 · PROGRAM AUDIO</span>
+          <span class="dim" id="audio-source-label">—</span>
+        </div>
+        <audio id="program-audio" controls preload="none"></audio>
+        <div class="bars" id="audio-bars" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        </div>
+      </div>
+      <div class="delivery">
+        <div><span class="dim">HLS</span><a href="/hls/index.m3u8" target="_blank">/hls/index.m3u8</a></div>
+        <div><span class="dim">归档</span><a href="/archive/program.ts" target="_blank">/archive/program.ts</a></div>
+        <div><span class="dim">节目监听</span><a href="/stream/program.mjpg" target="_blank">/stream/program.mjpg</a></div>
+      </div>
+    </section>
+
+    <section class="panel program-panel">
+      <div class="panel-head">
+        <h2>当前节目状态</h2>
+        <span class="dim" id="program-state-label">未切入</span>
+      </div>
+      <div class="stat-grid">
+        <div class="stat"><span>播出源</span><strong id="stat-onair">—</strong></div>
+        <div class="stat"><span>预监源</span><strong id="stat-pvw">—</strong></div>
+        <div class="stat"><span>编码延迟</span><strong id="stat-lag">—</strong></div>
+        <div class="stat"><span>缓冲区</span><strong id="stat-buffer">—</strong></div>
+      </div>
+      <div class="counters" id="onair-counters"></div>
+      <div class="final-pending" id="pending-take" hidden></div>
+      <div class="live-audio-note">
+        <span>节目音频</span>
+        <button id="audio-toggle" class="btn small" type="button">开启声音</button>
+        <span class="dim">浏览器需一次点击才能播放音频</span>
+      </div>
+    </section>
+
+    <section class="panel history-panel">
+      <div class="panel-head">
+        <h2>切换记录</h2>
+        <span class="dim">实际播出历史</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th><th>时间码</th><th>帧</th><th>样本</th><th>来源</th><th>目标</th><th>延迟</th>
+            </tr>
+          </thead>
+          <tbody id="take-log"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel decisions-panel">
+      <div class="panel-head">
+        <h2>同步决策</h2>
+        <span class="dim">补帧 / 丢帧 / 静音 记录</span>
+      </div>
+      <ul class="log" id="decision-log"></ul>
+    </section>
+
+    <section class="panel warnings-panel">
+      <div class="panel-head">
+        <h2>告警</h2>
+        <span class="dim" id="warn-count">0</span>
+      </div>
+      <ul class="log warn" id="warning-log"></ul>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>输入时钟彼此独立 · 切换以输出媒体时间为准 · 帧序与样本计数持续前进</span>
+    <span class="dim" id="uptime">—</span>
+  </footer>
+
+  <script src="/vendor/hls.js"></script>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
