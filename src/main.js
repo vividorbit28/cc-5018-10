@@ -5,6 +5,7 @@ import { Engine } from './engine.js';
 import { ProgramEncoder } from './program_encoder.js';
 import { SourceSimulator } from './source_simulator.js';
 import { Server } from './server.js';
+import { assertCompatibleFfmpeg, ffmpegStaticMismatch, mediaDependencyEvidence } from './media_runtime.js';
 import { ensureDir } from './util.js';
 
 function resolveFfmpeg() {
@@ -26,11 +27,21 @@ function resolveFfmpeg() {
 
 async function main() {
   const ffmpeg = resolveFfmpeg();
+  // Fail before any pipe opens if the decoder on disk cannot honour the
+  // adapter's contract. The probe reads the binary actually being executed.
+  const probe = assertCompatibleFfmpeg(ffmpeg);
+  const mismatch = ffmpegStaticMismatch(probe, config.root);
+  if (mismatch) console.warn(`[show-control] media dependency warning: ${mismatch}`);
   const outDir = path.join(config.dataDir, 'output');
   ensureDir(outDir);
 
   const encoder = new ProgramEncoder({ ffmpeg, output: config.output, outDir });
   const engine = new Engine({ config, ffmpeg, dataDir: config.dataDir });
+  engine.mediaDependency = {
+    ...mediaDependencyEvidence(ffmpeg),
+    adapterVersion: config.decode.adapterVersion,
+    staticMismatch: mismatch
+  };
   engine.attachEncoder(encoder);
   engine.attachSources({
     sources: config.sources,
@@ -61,6 +72,9 @@ async function main() {
   console.log(`  Program archive : ${url}archive/program.ts`);
   console.log(`  Program monitor : ${url}stream/program.mjpg`);
   console.log(`  Output format   : ${config.output.width}x${config.output.height}@${config.output.fps} ${config.output.sampleRate} Hz`);
+  console.log(
+    `  Media decoder   : FFmpeg ${probe.version} (${probe.status}, decode adapter ${config.decode.adapterVersion})`
+  );
   for (const source of config.sources) {
     console.log(
       `  Source ${source.label.padEnd(5)} : ${source.width}x${source.height}@${source.fps} ` +

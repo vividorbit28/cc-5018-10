@@ -7,15 +7,23 @@
 //      *encoded program output* and samples the delivered program picture,
 //      proving the picture and sound on air both match the kernel's selection;
 //   3. decodes the delivered MPEG-TS/HLS with ffmpeg and fails on any decode
-//      error or frame-count shortfall.
+//      error or frame-count shortfall;
+//   4. checks the versioned decode contract the kernel actually handed to
+//      ffmpeg (pixel format, rational time bases, drain policy, media
+//      dependency), and that metering comes from real samples;
+//   5. optionally replays finite fixtures through the migrated decoder to
+//      exercise end-of-stream drain at different frame rates
+//      (--fixtures, or the SHOWCONTROL_FIXTURES directory).
 //
 // Usage: node scripts/verify.js [--url http://127.0.0.1:8080] [--keep]
+//                              [--fixtures <dir>]
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
+import { runFixture } from '../test/decode_fixture_probe.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -27,6 +35,7 @@ function arg(name, fallback) {
 const baseUrl = arg('--url', 'http://127.0.0.1:8080').replace(/\/$/, '');
 const wsUrl = baseUrl.replace(/^http/, 'ws') + '/ws';
 const ffmpeg = process.env.FFMPEG || path.join(root, 'node_modules/ffmpeg-static/ffmpeg');
+const fixtureDir = arg('--fixtures', process.env.SHOWCONTROL_FIXTURES || '');
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let pass = 0;
@@ -284,6 +293,42 @@ async function main() {
   const sources = probe.sources;
   if (sources.length < 2) throw new Error('need at least two sources to verify a cut');
 
+  console.log('[0] decode contract handed to the decoder');
+  const contractState = await getState();
+  check(
+    'kernel runs the migrated decode adapter',
+    contractState.decode?.adapterVersion === '2.0.0',
+    `adapter ${contractState.decode?.adapterVersion}, configured ${contractState.decode?.configuredVersion}`
+  );
+  const plans = Object.values(contractState.decode?.plans || {});
+  check('every source has an explicit decode plan', plans.length === sources.length, `${plans.length}/${sources.length}`);
+  check(
+    'decode plans declare yuv420p and passthrough frame mapping',
+    plans.length > 0 && plans.every((plan) => plan.pixelFormat === 'yuv420p' && plan.fpsMode === 'passthrough'),
+    plans.map((plan) => `${plan.pixelFormat}/${plan.fpsMode}`).join(', ')
+  );
+  check(
+    'decode plans declare rational video and audio time bases',
+    plans.every((plan) => /^\d+\/\d+$/.test(plan.videoTimeBase) && /^\d+\/\d+$/.test(plan.audioTimeBase)),
+    plans.map((plan) => `v${plan.videoTimeBase} a${plan.audioTimeBase}`).join(' | ')
+  );
+  check(
+    'decode plans declare the end-of-stream drain policy',
+    plans.every((plan) => plan.drainMode === 'eof-flush'),
+    plans[0]?.drainMode || 'none'
+  );
+  const dependency = contractState.decode?.dependency || {};
+  check(
+    'media dependency is the validated FFmpeg build',
+    dependency.status === 'validated',
+    `FFmpeg ${dependency.version || '?'} (${dependency.status || 'unknown'}), ${dependency.validatedAgainst || 'no target'}`
+  );
+  check(
+    'no decode-plan field errors reported by ingestion',
+    !contractState.warnings?.some((w) => /decode plan|framecrc|time base/i.test(w.line || '')),
+    contractState.warnings?.map((w) => w.line).slice(0, 2).join(' | ') || 'none'
+  );
+
   // Let sources lock before starting.
   for (let i = 0; i < 60; i += 1) {
     const state = await getState();
@@ -353,6 +398,33 @@ async function main() {
     );
   }
 
+  console.log('\n[2b] program and preview audio come from real samples');
+  const audioState = await getState();
+  const programAudio = audioState.audio?.program || {};
+  const meter = programAudio.meter || {};
+  check(
+    'program audio meter is computed from encoder-bound samples',
+    meter.blocks > 0 && Number.isFinite(meter.rmsDb) && Number.isFinite(meter.peakDb),
+    `${meter.blocks} blocks, peak ${meter.peakDb} dBFS, rms ${meter.rmsDb} dBFS`
+  );
+  check(
+    'program audio health reflects the live signal, not an animation',
+    programAudio.health?.state === 'live' && meter.peakLevel > 0,
+    `${programAudio.health?.state}, level ${meter.peakLevel}`
+  );
+  const previewAudio = audioState.preview?.audio || {};
+  check(
+    'preview audio has real sample evidence for the previewed source',
+    previewAudio.source?.blocks > 0 && previewAudio.source?.samples > 0,
+    `${previewAudio.source?.blocks} blocks, ${previewAudio.source?.samples} samples, ${previewAudio.health?.state}`
+  );
+  const onAirSource = audioState.sources.find((s) => s.onAir);
+  check(
+    'per-source audio meters are exposed to the control page',
+    Boolean(onAirSource?.audio?.source) && onAirSource.audio.source.samples > 0,
+    `${onAirSource?.label}: ${onAirSource?.audio?.source?.rmsDb} dBFS`
+  );
+
   console.log('\n[3] delivered output is decodable');
   const lastArchive = await downloadArchive();
   const integrity = await archiveIntegrity(lastArchive.file);
@@ -386,6 +458,62 @@ async function main() {
       check('HLS segment decodes without errors', segIntegrity.ok, segIntegrity.detail || 'clean');
     }
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  if (fixtureDir) {
+    console.log(`\n[4] end-of-stream drain at different frame rates (${fixtureDir})`);
+    const fixtures = fs
+      .readdirSync(fixtureDir)
+      .filter((name) => /\.(ts|mp4|mkv|mov)$/i.test(name))
+      .sort();
+    check('fixture directory contains media', fixtures.length > 0, `${fixtures.length} file(s)`);
+    for (const name of fixtures) {
+      const file = path.join(fixtureDir, name);
+      for (const mode of ['current', 'legacy']) {
+        const run = await runFixture(file, { legacy: mode === 'legacy' });
+        const videoPts = run.video.map((entry) => entry.pts);
+        const audioPts = run.audio.map((entry) => entry.pts);
+        const monotonic = (values) => values.every((value, i) => i === 0 || value > values[i - 1]);
+        const label = `${name} (${mode === 'legacy' ? 'legacy 1.0.0 config' : 'adapter 2.0.0 plan'})`;
+        check(
+          `${label}: input ends after drain, not as a transport failure`,
+          run.finalState === 'ended' && run.down?.reason === 'eof' && run.down?.code === 0,
+          `${run.finalState}, reason ${run.down?.reason}, code ${run.down?.code}`
+        );
+        check(
+          `${label}: every frame is paired with a source timestamp`,
+          run.video.length > 0 &&
+            run.drained?.videoFramesWithoutMeta === 0 &&
+            run.drained?.videoMetaRowsWithoutFrame === 0,
+          `${run.video.length} frames, ${run.drained?.videoFramesWithoutMeta} unpaired, ` +
+            `${run.drained?.videoMetaRowsWithoutFrame} timestamps without a frame`
+        );
+        check(
+          `${label}: video and audio timestamps advance monotonically`,
+          monotonic(videoPts) && monotonic(audioPts),
+          `v ${run.video.length} / a ${run.audio.length} blocks`
+        );
+        check(
+          `${label}: timestamps use the source's rational time base`,
+          /^\d+\/\d+$/.test(run.drained?.videoTimeBase || '') &&
+            /^\d+\/\d+$/.test(run.drained?.audioTimeBase || ''),
+          `v ${run.drained?.videoTimeBase}, a ${run.drained?.audioTimeBase}`
+        );
+        check(
+          `${label}: every decoded frame carries a monotonic source timestamp`,
+          monotonic(videoPts),
+          `${videoPts.length} frames, first ${videoPts[0]}s last ${videoPts.at(-1)}s`
+        );
+        if (mode === 'legacy') {
+          const legacyFrom = run.ingest.contract().legacyFrom;
+          check(
+            `${label}: legacy config is converted and labels its origin`,
+            legacyFrom === '1.0.0',
+            `plan legacyFrom=${legacyFrom}, assumed ${run.plan.legacy?.assumed?.length ?? 0} field(s)`
+          );
+        }
+      }
+    }
   }
 
   client.close();

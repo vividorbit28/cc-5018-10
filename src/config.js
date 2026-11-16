@@ -111,6 +111,17 @@ export const config = {
   // Audio block delivered by each ingest (source-rate domain, 48 kHz after
   // resampling): 20 ms per block.
   ingestAudioBlock: num('INGEST_AUDIO_BLOCK', 960),
+  // Versioned decode contract. 2.0.0 is the explicit interface; "1.0.0" replays
+  // the original program config through the conversion path.
+  decode: {
+    adapterVersion: env.DECODE_ADAPTER_VERSION || '2.0.0',
+    pixelFormat: env.DECODE_PIXEL_FORMAT || 'yuv420p',
+    fpsMode: env.DECODE_FPS_MODE || 'passthrough',
+    scaleFlags: env.DECODE_SCALE_FLAGS || 'bilinear',
+    resampler: env.DECODE_RESAMPLER || 'soxr',
+    resamplerPrecision: num('DECODE_RESAMPLER_PRECISION', 28),
+    drainMode: env.DECODE_DRAIN_MODE || 'eof-flush'
+  },
   // Target distance behind each source's live edge, in milliseconds. This is the
   // fixed playout latency that makes a cut land on a real frame instead of
   // whatever arrived most recently.

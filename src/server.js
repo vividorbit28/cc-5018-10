@@ -86,13 +86,17 @@ export class Server {
   }
 
   broadcastFrame(kind, jpeg) {
+    // One message per frame: the JSON header line immediately followed by the
+    // JPEG bytes. The console parses the first newline and treats the rest as
+    // the picture; sending the header and the JPEG as two messages would make
+    // every frame a zero-byte image plus an unlabelled blob.
     const header = Buffer.from(`${JSON.stringify({ type: 'frame', kind, at: Date.now() })}\n`);
+    const payload = Buffer.concat([header, jpeg]);
     for (const ws of this.wss.clients) {
       if (ws.readyState !== ws.OPEN) continue;
       if (ws._frameKind !== kind) continue;
       if (ws.bufferedAmount > 1024 * 1024) continue;
-      ws.send(header);
-      ws.send(jpeg);
+      ws.send(payload);
     }
   }
 

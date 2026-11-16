@@ -39,7 +39,10 @@ const els = {
   programAudio: $('program-audio'),
   audioSourceLabel: $('audio-source-label'),
   audioBars: $('audio-bars'),
+  audioMeter: $('audio-meter'),
+  audioFault: $('audio-fault'),
   audioToggle: $('audio-toggle'),
+  previewAudioHealth: $('preview-audio-health'),
   uptime: $('uptime'),
 };
 
@@ -211,6 +214,9 @@ function applyState(state) {
     ? `${onAirSource.label} · ${onAirSource.tone} Hz · ${onAirSource.sampleRate / 1000} kHz 输入`
     : '无节目音频';
 
+  renderAudio(state);
+  renderPreviewMeta(state);
+
   // Take button reflects the kernel's pending-take state, not local intent.
   const previewId = p.preview;
   const canTake = Boolean(previewId) && previewId !== p.onAir && !p.pendingTake;
@@ -225,12 +231,52 @@ function applyState(state) {
   } else {
     els.pendingTake.hidden = true;
   }
-
-  els.audioBars.classList.toggle('muted', !app.audioStarted);
 }
 
 function labelOf(sources, id) {
   return sources.find((s) => s.id === id)?.label || id;
+}
+
+function renderAudio(state) {
+  // Bars and readout reflect the dBFS the kernel measured from the exact
+  // samples handed to the encoder. They are not an animation: a silent or stale
+  // program shows an empty meter and the reason below it.
+  const audio = state.audio?.program || {};
+  const meter = audio.meter || {};
+  const health = audio.health || { state: 'waiting', detail: '等待音频' };
+  const level = app.audioStarted ? meter.peakLevel ?? 0 : 0;
+  const bars = els.audioBars.children;
+  for (let i = 0; i < bars.length; i += 1) {
+    const threshold = (i + 1) / bars.length;
+    bars[i].style.height = `${Math.max(6, Math.round(Math.min(1, level) * threshold * 100))}%`;
+  }
+  els.audioBars.classList.toggle('live', app.audioStarted && health.state === 'live');
+  els.audioBars.classList.toggle('muted', !app.audioStarted || health.state !== 'live');
+  els.audioMeter.textContent =
+    meter.rmsDb === undefined ? '-- dBFS' : `${meter.peakDb.toFixed(1)} / 均 ${meter.rmsDb.toFixed(1)} dBFS`;
+
+  const fault =
+    health.state === 'live'
+      ? null
+      : health.state === 'waiting'
+        ? '节目音频尚未开始输出'
+        : health.state === 'stale'
+          ? `节目音频中断：${health.detail}`
+          : `节目音频静音：${health.detail}${audio.error ? ` · ${audio.error}` : ''}`;
+  els.audioFault.hidden = !fault;
+  els.audioFault.textContent = fault || '';
+  els.audioFault.dataset.state = health.state;
+}
+
+function renderPreviewMeta(state) {
+  const preview = state.preview || {};
+  const health = preview.audio?.health || { state: 'waiting', detail: '预监源音频未就绪' };
+  const meter = preview.audio?.source;
+  const label = health.state === 'live' && meter
+    ? `预监源音频 ${meter.rmsDb.toFixed(1)} dBFS`
+    : `预监源音频异常：${health.detail}`;
+  els.previewAudioHealth.textContent = label;
+  els.previewAudioHealth.dataset.state = health.state;
 }
 
 function renderSources(sources) {
@@ -537,13 +583,13 @@ function startProgramAudio() {
   app.audioStarted = true;
   els.programAudio.src = `/audio/program.mp3?t=${Date.now()}`;
   els.programAudio.play().catch(() => {
-    els.audioStarted = false;
+    app.audioStarted = false;
     els.audioToggle.textContent = '开启声音';
+    flashTakeStatus('浏览器阻止了音频播放，请再次点击「开启声音」', 'err');
     return;
   });
   els.audioToggle.textContent = '静音';
-  els.audioBars.classList.add('live');
-  els.audioBars.classList.remove('muted');
+  if (app.state) renderAudio(app.state);
 }
 
 function stopProgramAudio() {
@@ -552,8 +598,7 @@ function stopProgramAudio() {
   els.programAudio.removeAttribute('src');
   els.programAudio.load();
   els.audioToggle.textContent = '开启声音';
-  els.audioBars.classList.remove('live');
-  els.audioBars.classList.add('muted');
+  if (app.state) renderAudio(app.state);
 }
 
 els.audioToggle.addEventListener('click', () => {

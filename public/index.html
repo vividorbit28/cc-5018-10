@@ -97,9 +97,13 @@
           <span class="dim" id="audio-source-label">—</span>
         </div>
         <audio id="program-audio" controls preload="none"></audio>
-        <div class="bars" id="audio-bars" aria-hidden="true">
-          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        <div class="meter-row">
+          <div class="bars" id="audio-bars" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          </div>
+          <span class="meter-readout" id="audio-meter">-- dBFS</span>
         </div>
+        <div class="meter-fault" id="audio-fault" hidden></div>
       </div>
       <div class="delivery">
         <div><span class="dim">HLS</span><a href="/hls/index.m3u8" target="_blank">/hls/index.m3u8</a></div>
@@ -124,7 +128,7 @@
       <div class="live-audio-note">
         <span>节目音频</span>
         <button id="audio-toggle" class="btn small" type="button">开启声音</button>
-        <span class="dim">浏览器需一次点击才能播放音频</span>
+        <span class="dim" id="preview-audio-health">预监源音频 —</span>
       </div>
     </section>
 

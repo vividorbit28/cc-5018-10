@@ -3,6 +3,15 @@ import { SyncSource } from './sync_source.js';
 import { SourceIngest } from './source_ingest.js';
 import { Compositor } from './compositor.js';
 import { PreviewCompositor } from './preview_compositor.js';
+import {
+  DECODE_ADAPTER_VERSION,
+  LEGACY_DECODE_ADAPTER_VERSION,
+  createDecodePlan,
+  inputKindForUrl,
+  migrateLegacyProgramConfig,
+  planContract
+} from './decode_adapter.js';
+import { createAudioMeter, meterHealth, meterS16le, summarizeMeter } from './audio_meter.js';
 import { AggregateLogger, RingLog, timecodeFromFrames } from './util.js';
 
 class ProgramClock {
@@ -34,6 +43,11 @@ export class Engine extends EventEmitter {
     if (!Number.isInteger(this.samplesPerFrame)) {
       throw new Error('OUT_SAMPLE_RATE must be an integer multiple of OUT_FPS');
     }
+    this.legacyProgramConfigs = null;
+    this.lastDrain = null;
+    this.mediaDependency = null;
+    this.decodePlans = new Map();
+    this.sourceMeters = new Map();
     this.clock = new ProgramClock(config.output.fps);
     this.syncer = new Map();
     this.ingests = new Map();
@@ -54,6 +68,14 @@ export class Engine extends EventEmitter {
     this.programMonitor = { jpeg: null, seq: 0, at: 0 };
     this.programAudioSeq = 0;
     this.programAudioBytes = 0;
+    this.programAudioMeter = createAudioMeter();
+    this.outputAudio = {
+      state: 'idle',
+      meter: this.programAudioMeter,
+      lastBlockAt: 0,
+      blocks: 0,
+      error: null
+    };
     this.lastTake = null;
     this.running = false;
     this.timer = null;
@@ -77,6 +99,9 @@ export class Engine extends EventEmitter {
     encoder.on('monitor-audio', (chunk) => {
       this.programAudioBytes += chunk.length;
       this.programAudioSeq += 1;
+      this.outputAudio.lastBlockAt = this.now();
+      this.outputAudio.blocks += 1;
+      this.outputAudio.state = 'live';
       this.emit('program-audio', chunk);
     });
     encoder.on('warning', (line) => this.warn('encoder', line));
@@ -87,6 +112,8 @@ export class Engine extends EventEmitter {
 
   attachSources({ sources, simulatorFactory }) {
     this.simulators = new Map();
+    this.decodePlans = new Map();
+    this.sourceMeters = new Map();
     for (const source of sources) {
       const sync = new SyncSource(source, {
         fps: this.outputConfig.fps,
@@ -98,25 +125,24 @@ export class Engine extends EventEmitter {
         clock: { now: () => this.clock.pts }
       });
       this.syncer.set(source.id, sync);
+      const plan = this.buildDecodePlan(source);
+      this.decodePlans.set(source.id, plan);
       const ingest = new SourceIngest(source, {
         ffmpeg: this.ffmpeg,
-        raster: { width: this.outputConfig.width, height: this.outputConfig.height },
-        audioRate: this.outputConfig.sampleRate,
-        audioBlockSamples: this.config.ingestAudioBlock,
-        preview: {
-          fps: this.config.monitor.fps,
-          width: this.config.monitor.width,
-          height: this.config.monitor.height
-        }
+        plan
       });
       this.ingests.set(source.id, ingest);
+      const meter = createAudioMeter();
+      this.sourceMeters.set(source.id, meter);
       ingest.on('video', ({ pts, duration, data }) => {
         sync.onVideo({ pts, duration, data });
         this.sourceVideoAt.set(source.id, this.now());
       });
       ingest.on('audio', ({ pts, data }) => {
         sync.onAudio({ pts, data });
+        meterS16le(meter, data);
         this.sourceAudioAt.set(source.id, this.now());
+        if (this.previewId === source.id) this.emitStateThrottled();
       });
       ingest.on('preview', (jpeg) => {
         this.previews.set(source.id, { jpeg, at: this.now() });
@@ -127,16 +153,30 @@ export class Engine extends EventEmitter {
       });
       ingest.on('online', () => {
         sync.setOnline(true);
-        this.logDecision('source-locked', { source: source.id, note: 'transport online, acquiring timestamps' });
+        this.logDecision('source-locked', {
+          source: source.id,
+          note: `transport online, acquiring timestamps (decode ${plan.adapterVersion})`
+        });
         this.emitStateNow();
       });
-      ingest.on('down', ({ code, signal } = {}) => {
+      ingest.on('drained', (evidence) => {
+        this.lastDrain = { source: source.id, at: this.now(), ...evidence };
+        this.logDecision('source-drained', {
+          source: source.id,
+          note: `end of stream: ${evidence.videoFrames} frames / ${evidence.audioBlocks} audio blocks flushed`
+        });
+        this.emitStateNow();
+      });
+      ingest.on('down', ({ code, signal, reason } = {}) => {
         sync.setOnline(false);
         this.logDecision('source-down', {
           source: source.id,
-          note: `transport lost (${code ?? signal ?? '?'}); holding last frame, rebuilding input`
+          note:
+            reason === 'eof'
+              ? 'input ended after drain; holding last frame'
+              : `transport lost (${code ?? signal ?? '?'}); holding last frame, rebuilding input`
         });
-        if (signal !== 'rebuild') this.scheduleIngestRestart(source.id);
+        if (reason !== 'eof' && signal !== 'rebuild') this.scheduleIngestRestart(source.id);
         this.emitStateNow();
       });
       ingest.on('warning', (line) => this.warn(source.id, line));
@@ -146,6 +186,60 @@ export class Engine extends EventEmitter {
     }
     this.sourceVideoAt = new Map();
     this.sourceAudioAt = new Map();
+  }
+
+  // Builds the explicit 2.0.0 plan handed to the decode adapter. Nothing is
+  // defaulted: a source missing a raster, rate or URL fails at startup with a
+  // named error instead of decoding with an implicit value.
+  //
+  // DECODE_ADAPTER_VERSION=1.0.0 selects the legacy program-config path: the
+  // same explicit plan is produced, but through the converter, and the plan
+  // records that it was migrated rather than authored.
+  buildDecodePlan(source) {
+    if (this.config.decode.adapterVersion === LEGACY_DECODE_ADAPTER_VERSION) {
+      return migrateLegacyProgramConfig(source, {
+        version: LEGACY_DECODE_ADAPTER_VERSION,
+        url: source.url,
+        raster: { width: this.outputConfig.width, height: this.outputConfig.height },
+        fps: source.fps,
+        audioRate: this.outputConfig.sampleRate,
+        audioBlockSamples: this.config.ingestAudioBlock,
+        preview: {
+          fps: this.config.monitor.fps,
+          width: this.config.monitor.width,
+          height: this.config.monitor.height
+        }
+      });
+    }
+    return createDecodePlan({
+      version: DECODE_ADAPTER_VERSION,
+      source: { id: source.id, label: source.label },
+      raster: { width: this.outputConfig.width, height: this.outputConfig.height },
+      video: {
+        pixelFormat: this.config.decode.pixelFormat,
+        fpsMode: this.config.decode.fpsMode,
+        scaleFlags: this.config.decode.scaleFlags,
+        fps: source.fps
+      },
+      audio: {
+        sampleRate: this.outputConfig.sampleRate,
+        channels: 2,
+        sampleFormat: 's16',
+        outputFormat: 's16le',
+        blockSamples: this.config.ingestAudioBlock,
+        resampler: this.config.decode.resampler,
+        resamplerPrecision: this.config.decode.resamplerPrecision
+      },
+      preview: {
+        fps: this.config.monitor.fps,
+        width: this.config.monitor.width,
+        height: this.config.monitor.height,
+        jpegQuality: 7
+      },
+      previewAudio: { sampleRate: 48000, codec: 'libmp3lame', bitrate: '64k' },
+      input: { url: source.url, kind: inputKindForUrl(source.url), pacing: 'realtime' },
+      drain: { mode: this.config.decode.drainMode, eofFlush: true, flushPackets: true }
+    });
   }
 
   get compositor() {
@@ -307,6 +401,7 @@ export class Engine extends EventEmitter {
 
     const audio = this.pullProgramAudio(T, onAir);
     this.encoder.writeAudio(audio.buffer);
+    this.updateProgramAudio(audio);
 
     this.recordDecisions(onAir, selection, audio, T);
 
@@ -327,6 +422,23 @@ export class Engine extends EventEmitter {
       return { buffer: Buffer.alloc(count * 4, 0), status: 'silence', reason: 'no-program' };
     }
     return onAir.pullAudio(T, count);
+  }
+
+  // Program audio evidence is computed from the exact samples written to the
+  // encoder. A muted source, a starved timeline or an unopened monitor shows up
+  // as `silent`/`stale` with a dBFS figure rather than a decorative bar.
+  updateProgramAudio(audio) {
+    meterS16le(this.programAudioMeter, audio.buffer);
+    this.outputAudio.state = audio.status === 'silence' ? 'silent' : audio.status === 'partial' ? 'partial' : 'live';
+    this.outputAudio.lastBlockAt = this.now();
+    if (audio.status === 'silence') {
+      this.outputAudio.error = audio.reason === 'no-program' ? 'no program on air' : 'source produced no audio';
+    } else if (audio.status === 'partial') {
+      this.outputAudio.error = `audio gap muted ${audio.muted ?? 0} samples`;
+    } else {
+      this.outputAudio.error = null;
+    }
+    this.outputAudio.blocks += 1;
   }
 
   recordDecisions(onAir, selection, audio, T) {
@@ -589,6 +701,7 @@ export class Engine extends EventEmitter {
       const sync = this.syncer.get(source.id);
       const ingest = this.ingests.get(source.id);
       const simulator = this.simulators?.get(source.id);
+      const meter = this.sourceMeters.get(source.id);
       const snap = sync ? sync.snapshot(T) : null;
       return {
         ...source,
@@ -597,10 +710,16 @@ export class Engine extends EventEmitter {
         onAir: this.onAirId === source.id,
         previewed: this.previewId === source.id,
         ingestState: ingest ? ingest.state : 'idle',
+        decode: ingest ? ingest.contract() : null,
+        audio: meter
+          ? { source: summarizeMeter(meter), health: meterHealth(meter, this.now()) }
+          : null,
         simulator: simulator ? simulator.snapshot() : null,
         sync: snap
       };
     });
+    const previewSource = this.previewId ? this.config.sources.find((s) => s.id === this.previewId) : null;
+    const previewMeter = this.previewId ? this.sourceMeters.get(this.previewId) : null;
     return {
       seq: this.stateSeq,
       running: this.running,
@@ -625,6 +744,32 @@ export class Engine extends EventEmitter {
           ? { sourceId: this.pendingTake.sourceId, label: this.labelFor(this.pendingTake.sourceId), requestedAt: this.pendingTake.requestedAt }
           : null,
         lastTake: this.lastTake
+      },
+      preview: {
+        sourceId: this.previewId,
+        label: previewSource ? previewSource.label : null,
+        audio: previewMeter
+          ? { source: summarizeMeter(previewMeter), health: meterHealth(previewMeter, this.now()) }
+          : null
+      },
+      audio: {
+        program: {
+          source: this.onAirId,
+          label: this.onAirId ? this.labelFor(this.onAirId) : null,
+          ...this.outputAudio,
+          meter: summarizeMeter(this.programAudioMeter),
+          health: meterHealth(this.programAudioMeter, this.now())
+        }
+      },
+      decode: {
+        adapterVersion: DECODE_ADAPTER_VERSION,
+        legacyVersion: LEGACY_DECODE_ADAPTER_VERSION,
+        configuredVersion: this.config.decode.adapterVersion,
+        plans: Object.fromEntries(
+          [...this.decodePlans].map(([id, plan]) => [id, planContract(plan)])
+        ),
+        lastDrain: this.lastDrain,
+        dependency: this.mediaDependency
       },
       output: this.encoder ? this.encoder.snapshot() : { running: false },
       sources,
